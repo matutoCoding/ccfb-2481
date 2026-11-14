@@ -1,0 +1,105 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>运行时渲染验证</title></head>
+<body>
+<canvas id="c" width="400" height="300"></canvas>
+<pre id="log">running...</pre>
+<script type="module">
+  const logEl = document.getElementById('log');
+  const lines = [];
+  const log = (...a) => lines.push(a.join(' '));
+  const fail = (msg) => { log('❌ ' + msg); };
+  try {
+    const canvas = document.getElementById('c');
+    const Rmod = await import('/src/webgl/renderer.ts');
+    const cmod = await import('/src/nodes/compiler.ts');
+    const dmod = await import('/src/state/defaults.ts');
+    const lmod = await import('/src/vessel/lathe.ts');
+    const pmod = await import('/src/vessel/presets.ts');
+
+    const renderer = new Rmod.Renderer(canvas);
+    log('Renderer 创建成功');
+
+    const settings = {
+      exposure: 1.1, tonemap: 'aces', msaa: true, envRotation: 20,
+      envIntensity: 1.0, lightIntensity: 2.2, background: 'env',
+      backgroundColor: [0.08, 0.08, 0.09], fov: 38,
+    };
+    const cam = { yaw: 0.6, pitch: 0.25, distance: 2.6, target: [0, 0.45, 0] };
+
+    // 四个预设器型都建网格
+    for (const preset of pmod.VESSEL_PRESETS) {
+      const vessel = preset.build();
+      const mesh = lmod.buildLatheMesh(vessel);
+      if (!(mesh.positions.length > 0) || mesh.indexCount === 0) throw new Error('网格为空: ' + vessel.name);
+      renderer.setMesh(mesh);
+      log(`网格「${vessel.name}」顶点 ${mesh.positions.length / 3} 三角面 ${mesh.indexCount / 3}`);
+    }
+
+    // 编译并设置材质
+    const mat = dmod.createMaterial('运行时测试');
+    const compiled = cmod.compileGraph(mat.graph);
+    const errs = renderer.setMaterial(mat, compiled);
+    if (errs.length) throw new Error('材质设置失败: ' + errs.map(e => e.message).join(';'));
+    log('材质 program 设置成功，uniform', compiled.uniforms.length, '个');
+
+    const gl = renderer.gl;
+    const checkGLErrors = (label) => {
+      const e = gl.getError();
+      if (e !== 0) fail(`${label} GL error 0x${e.toString(16)}`);
+    };
+
+    // 实时渲染一帧（MSAA 路径）
+    renderer.render(settings, mat.glaze, cam);
+    renderer.present();
+    checkGLErrors('MSAA 实时帧');
+    log('MSAA 实时帧渲染完成');
+
+    // 关闭 MSAA 再渲染（RGBA16F 非多采样路径）
+    renderer.render({ ...settings, msaa: false }, mat.glaze, cam);
+    renderer.present();
+    checkGLErrors('非 MSAA 帧');
+    log('非 MSAA 帧渲染完成');
+
+    // 分块渲染（小尺寸，验证 readPixels/FLOAT 与拼接）
+    const signal = { cancelled: false };
+    let lastP = null;
+    const img = await renderer.renderTiles(
+      settings, mat.glaze, cam, 800, 600,
+      (done, total) => { lastP = { done, total }; }, signal,
+    );
+    checkGLErrors('分块渲染');
+    if (!img || img.width !== 800 || img.height !== 600) throw new Error('分块输出尺寸错误');
+    log(`分块渲染完成 进度=${lastP.done}/${lastP.total} ImageData=${img.width}x${img.height}`);
+
+    // 检查输出不是全黑（统计亮度）
+    let sum = 0, nonZero = 0;
+    for (let i = 0; i < img.data.length; i += 4) {
+      const lum = img.data[i] + img.data[i + 1] + img.data[i + 2];
+      sum += lum;
+      if (lum > 12) nonZero++;
+    }
+    const avg = sum / (img.data.length / 4) / 3;
+    const fillRatio = nonZero / (img.data.length / 4);
+    log(`输出平均亮度 ${avg.toFixed(1)} / 255，非黑像素占比 ${(fillRatio * 100).toFixed(1)}%`);
+    if (avg < 1) fail('输出近乎全黑，渲染可能异常');
+    else log('输出含有效光照内容');
+
+    // 取消信号
+    const cancelled = await renderer.renderTiles(settings, mat.glaze, cam, 1024, 1024,
+      () => {}, { cancelled: true });
+    if (cancelled !== null) fail('取消信号未生效');
+    else log('取消信号正确返回 null');
+
+    renderer.dispose();
+    checkGLErrors('dispose');
+    log('资源释放完成');
+    log(lines.some(l => l.startsWith('❌')) ? '\n❌ 运行时测试有失败项' : '\n✅ 运行时渲染测试全部通过');
+  } catch (e) {
+    log('异常:', e.message, e.stack?.split('\n')[1] ?? '');
+    log('❌ 测试中断');
+  }
+  logEl.textContent = lines.join('\n');
+</script>
+</body>
+</html>

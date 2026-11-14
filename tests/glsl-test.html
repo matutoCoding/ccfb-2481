@@ -1,0 +1,123 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>GLSL 离线编译验证</title></head>
+<body>
+<canvas id="c" width="64" height="64"></canvas>
+<pre id="log">running...</pre>
+<script type="module">
+  const logEl = document.getElementById('log');
+  const lines = [];
+  const log = (...a) => { lines.push(a.join(' ')); };
+  try {
+    const canvas = document.getElementById('c');
+    const gl = canvas.getContext('webgl2', { antialias: false });
+    if (!gl) throw new Error('WebGL2 不可用');
+    log('WebGL2:', gl.getParameter(gl.VERSION));
+    log('扩展 EXT_color_buffer_float:', !!gl.getExtension('EXT_color_buffer_float'));
+
+    const vmod = await import('/src/webgl/shaders.ts');
+    const cmod = await import('/src/nodes/compiler.ts');
+    const dmod = await import('/src/state/defaults.ts');
+    const lmod = await import('/src/nodes/glslLib.ts');
+
+    const compile = (type, src, label) => {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        log(`[失败] ${label}:`, gl.getShaderInfoLog(sh));
+        return null;
+      }
+      log(`[通过] ${label}`);
+      return sh;
+    };
+    const link = (vs, fs, label) => {
+      const p = gl.createProgram();
+      gl.attachShader(p, vs); gl.attachShader(p, fs);
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+        log(`[链接失败] ${label}:`, gl.getProgramInfoLog(p));
+        return false;
+      }
+      log(`[链接通过] ${label}`);
+      return true;
+    };
+
+    // 1. 环境 shader
+    const envVs = compile(gl.VERTEX_SHADER, vmod.ENV_VERT, 'ENV 顶点');
+    const envFs = compile(gl.FRAGMENT_SHADER, vmod.ENV_FRAG, 'ENV 片元');
+    if (envVs && envFs) link(envVs, envFs, '环境程序');
+
+    // 2. 背景 shader
+    const bgVs = compile(gl.VERTEX_SHADER, vmod.BG_VERT, 'BG 顶点');
+    const bgFs = compile(gl.FRAGMENT_SHADER, vmod.BG_FRAG, 'BG 片元');
+    if (bgVs && bgFs) link(bgVs, bgFs, '背景程序');
+
+    // 3. 默认材质完整主 shader
+    const mat = dmod.createMaterial('测试');
+    const compiled = cmod.compileGraph(mat.graph);
+    log('材质图编译:', compiled.ok, '错误数:', compiled.errors.length);
+    const fragSrc = vmod.FRAGMENT_SHADER_HEADER
+      .replace('// ===== GLSL_LIB =====', lmod.GLSL_LIB)
+      .replace('// ===== MATERIAL_GLSL =====', compiled.glsl);
+    const mainVs = compile(gl.VERTEX_SHADER, vmod.VERTEX_SHADER, '主顶点');
+    const mainFs = compile(gl.FRAGMENT_SHADER, fragSrc, '主片元(默认材质)');
+    let mainOk = false;
+    if (mainVs && mainFs) mainOk = link(mainVs, mainFs, '主程序(默认材质)');
+
+    // 4. 遍历每种节点类型各建一个最小图，确保所有 emit 分支都能编译
+    const { NODE_DEFS } = await import('/src/nodes/defs.ts');
+    let nodeFail = 0;
+    for (const def of NODE_DEFS) {
+      if (def.type === 'output') continue;
+      const g = { nodes: [] };
+      const out = dmod.createNode('output', 400, 100);
+      const node = dmod.createNode(def.type, 100, 100);
+      g.nodes = [out, node];
+      // 把每个输出连到类型匹配的输出端口
+      for (const op of def.outputs) {
+        const target = { vec3: 'baseColor', vec2: null, float: 'roughness' }[op.type];
+        if (target) out.inputs[target] = { node: node.id, port: op.id };
+      }
+      // 给所有输入端口接常量/坐标
+      for (const ip of def.inputs) {
+        if (ip.type === 'vec2') {
+          const coord = dmod.createNode('coord', 0, 250);
+          g.nodes.push(coord);
+          node.inputs[ip.id] = { node: coord.id, port: 'uv' };
+        } else if (ip.type === 'vec3') {
+          const coord = dmod.createNode('coord', 0, 250);
+          g.nodes.push(coord);
+          node.inputs[ip.id] = { node: coord.id, port: ip.id === 'normal' ? 'normal' : 'local' };
+        } else {
+          const con = dmod.createNode('constant', 0, 350);
+          g.nodes.push(con);
+          node.inputs[ip.id] = { node: con.id, port: 'value' };
+        }
+      }
+      const r = cmod.compileGraph(g);
+      if (!r.ok) { log(`[图错误] 节点 ${def.type}:`, r.errors.map(e => e.message).join('; ')); nodeFail++; continue; }
+      const fs = vmod.FRAGMENT_SHADER_HEADER
+        .replace('// ===== GLSL_LIB =====', lmod.GLSL_LIB)
+        .replace('// ===== MATERIAL_GLSL =====', r.glsl);
+      const sh = compile(gl.FRAGMENT_SHADER, fs, `节点「${def.label}」(${def.type})`);
+      if (!sh) nodeFail++;
+      else gl.deleteShader(sh);
+    }
+
+    // 5. 验证错误定位：制造一个结构错误
+    const bad = dmod.createMaterial('坏图');
+    bad.graph.nodes = bad.graph.nodes.filter(n => n.type !== 'output');
+    const badR = cmod.compileGraph(bad.graph);
+    log('缺少输出节点的校验:', badR.ok === false && badR.errors[0]?.message.includes('材质输出') ? '正确拦截' : '未正确拦截');
+
+    log(mainOk && nodeFail === 0 ? '\n✅ 全部 shader 编译链接成功' : `\n❌ 有 ${nodeFail} 个节点 shader 失败`);
+  } catch (e) {
+    log('异常:', e.message, e.stack);
+  }
+  logEl.textContent = lines.join('\n');
+  document.title = 'DONE';
+  window.__testDone = true;
+</script>
+</body>
+</html>
